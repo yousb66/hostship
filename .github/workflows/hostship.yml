@@ -32,11 +32,21 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 检查代理 IP
+      - name: 检查代理状态
+        # 仓库是 public，Actions 日志公开可读。节点出口 IP 属于凭证级信息
+        # （暴露后可直接被针对性封禁），因此这里只打印连通性结论 + 脱敏后的
+        # IP 前缀，绝不输出完整地址。
         run: |
           if [ "${IS_PROXY:-false}" = "true" ]; then
-            PROXY_IP=$(curl -x "$PROXY_SERVER" -s --max-time 15 https://api.ipify.org || echo "未知")
-            echo "✅ 代理已启用，出口IP：$PROXY_IP"
+            RAW_IP=$(curl -x "$PROXY_SERVER" -s --max-time 15 https://api.ipify.org || echo "")
+            if [ -n "$RAW_IP" ]; then
+              # 同时注册为掩码，防止后续任何步骤意外回显完整 IP
+              echo "::add-mask::$RAW_IP"
+              MASKED=$(printf '%s' "$RAW_IP" | awk -F. 'NF==4{print $1"."$2".x.x"} NF!=4{print "x.x.x.x"}')
+              echo "✅ 代理已启用，出口IP：$MASKED（已脱敏）"
+            else
+              echo "⚠️ 代理已启用，但出口 IP 探测失败"
+            fi
           else
             echo "ℹ️ 未配置 NODE_LINK 或代理启动失败，使用直连模式"
           fi

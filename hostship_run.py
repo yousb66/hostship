@@ -15,9 +15,21 @@ HOSTSHIP_LOGIN = f"{HOSTSHIP_BASE}/auth/login"
 EMAIL = os.getenv("HOSTSHIP_EMAIL")
 PASSWORD = os.getenv("HOSTSHIP_PASSWORD")
 
+# 一个账号下可能有多个服务器；原来的实现只点第一个入口就 break，
+# 导致多服务器账号只续期了一台。这里枚举后逐个处理。
+MAX_SERVERS = 20          # 防御性上限，避免选择器误匹配导致死循环
+SERVER_ENTRY_SELECTORS = (
+    "a[href*='/server/']",
+    "a:contains('MANAGE SERVER')",
+    "button:contains('MANAGE SERVER')",
+    "a:contains('Manage Server')",
+    "button:contains('Manage Server')",
+)
+
 # ================== 辅助功能 ==================
 def is_linux() -> bool:
     return platform.system().lower() == "linux"
+
 
 def send_tg_notification(message, photo_path=None):
     token = os.getenv("TG_BOT_TOKEN")
@@ -38,101 +50,240 @@ def send_tg_notification(message, photo_path=None):
     except Exception as e:
         print(f"TG 通知异常: {e}")
 
-# ================== 续期逻辑 ==================
-def process_renewal(sb):
-    time.sleep(5) 
-    
-    # 1. 点击 MANAGE SERVER 进入详情页
+
+def _split_selectors(selector):
+    """把 "a:contains('X'), button:contains('Y')" 拆成独立选择器列表。
+
+    SeleniumBase 的 is_element_visible() 接受逗号分隔的多选择器，
+    但 find_elements() 不接受（会返回 0 个），因此需要调用方自行拆分。
+    """
+    return [s.strip() for s in selector.split(",") if s.strip()]
+
+
+def _visible_elements(sb, selector):
+    """返回 selector 命中且当前可见的元素列表（失败返回空列表）。
+
+    UC 模式下 WebElement.is_displayed() 返回 None（不可调用），直接用会
+    TypeError，因此可见性一律交给 SeleniumBase 的封装判断，不碰原生方法。
+    逐个拆分选择器调用，绕开 find_elements 不支持多选择器的问题。
+    """
+    out = []
+    for one in _split_selectors(selector):
+        try:
+            if not sb.is_element_visible(one):
+                continue
+            out.extend(sb.find_elements(one))
+        except Exception:
+            continue
+    return out
+
+
+def _first_visible_selector(sb, selector):
+    """返回第一个可见的单个选择器（供 sb.click/get_text 使用）。"""
+    for one in _split_selectors(selector):
+        try:
+            if sb.is_element_visible(one):
+                return one
+        except Exception:
+            continue
+    return None
+
+
+def _element_label(el):
+    """取元素可见文本，作为服务器标识。UC 模式下 .text 可能为 None。"""
     try:
-        print("🔍 正在查找 'MANAGE SERVER' 按钮...")
-        server_selectors = [
-            "a:contains('MANAGE SERVER')", 
-            "button:contains('MANAGE SERVER')",
-            "a:contains('Manage Server')",
-            "button:contains('Manage Server')",
-            'a[href*="/server/"]'
-        ]
-        
-        found = False
-        for selector in server_selectors:
-            if sb.is_element_visible(selector):
-                print(f"✅ 找到入口，点击进入控制台...")
-                sb.click(selector)
-                found = True
-                break
-        
-        if not found:
-            print("⚠️ 未能在主页找到 'MANAGE SERVER' 按钮，当前账号下可能没有服务器。")
-            sb.save_screenshot("hostship_no_server.png")
-            send_tg_notification("⚠️ <b>Host-Ship 状态</b>\n账号登录成功，但未发现 Manage Server 按钮。", "hostship_no_server.png")
-            return
+        t = (el.text or "").strip()
+        if t:
+            return re.sub(r"\s+", " ", t)[:60]
+    except Exception:
+        pass
+    for attr in ("innerText", "textContent"):
+        try:
+            t = (el.get_attribute(attr) or "").strip()
+            if t:
+                return re.sub(r"\s+", " ", t)[:60]
+        except Exception:
+            pass
+    return ""
 
+
+# ================== 发现服务器 ==================
+def discover_servers(sb, dashboard_url):
+    """枚举面板上所有服务器入口。
+
+    返回 (targets, selector)：
+      targets 是 [{"label":..., "href":...}]，href 可能为 None（纯按钮入口）。
+    每次调用前都重新打开 dashboard，保证元素引用新鲜、顺序稳定。
+    """
+    try:
+        sb.open(dashboard_url)
+    except Exception:
+        sb.uc_open(dashboard_url)
+    time.sleep(4)
+
+    for selector in SERVER_ENTRY_SELECTORS:
+        els = _visible_elements(sb, selector)
+        if not els:
+            continue
+
+        targets, seen = [], set()
+        for el in els:
+            try:
+                href = el.get_attribute("href")
+            except Exception:
+                href = None
+            label = _element_label(el)
+            key = href or f"idx:{len(targets)}"
+            if key in seen:          # 同一服务器可能被多个选择器命中，去重
+                continue
+            seen.add(key)
+            targets.append({"label": label, "href": href})
+
+        if targets:
+            print(f"✅ 命中选择器 {selector!r}，发现 {len(targets)} 个服务器入口")
+            return targets, selector
+    return [], None
+
+
+# ================== 单台服务器续期 ==================
+def renew_server(sb, target, index, dashboard_url):
+    """处理一台服务器，返回结果字典（不抛异常，失败也返回状态）。"""
+    result = {"index": index, "label": target.get("label") or f"服务器#{index}",
+              "days": "未知", "status": "unknown", "detail": ""}
+    shot = f"hostship_{index}.png"
+
+    try:
+        if target.get("href"):
+            sb.open(target["href"])
+        else:
+            # 没有 href 的入口只能按下标点击；先回 dashboard 再点
+            sb.open(dashboard_url)
+            time.sleep(3)
+            for selector in SERVER_ENTRY_SELECTORS:
+                els = _visible_elements(sb, selector)
+                if els and index < len(els):
+                    els[index].click()
+                    break
+        time.sleep(5)
     except Exception as e:
-        print(f"进入服务器详情页失败: {e}")
-        return
+        result["status"] = "nav_failed"
+        result["detail"] = f"无法打开页面: {e}"
+        return result
 
-    time.sleep(6)
-    current_server_url = sb.get_current_url()
-    print(f"🌐 打开服务器控制台: {current_server_url}")
-    
-    # 2. 抓取页面上的续期信息
+    # 读续期倒计时。注意 "1 Day" 是合法的单数形式，原正则要求 Days 会漏掉。
     try:
         page_text = sb.get_text("body")
-        days_match = re.search(r'RENEWAL IN\s*(\d+\s*Days)', page_text, re.IGNORECASE)
-        days_left = days_match.group(1) if days_match else "未知天数"
-        
-        print(f"📅 当前续期倒计时: {days_left}")
-        
-        renew_button_selector = "button:contains('Renew'), button:contains('RENEW'), a:contains('Renew')"
-        
-        if sb.is_element_visible(renew_button_selector):
-            btn_text = sb.get_text(renew_button_selector).strip()
-            
-            if "Limit Reached" in btn_text or "limit reached" in btn_text.lower():
-                print(f"ℹ️ 按钮显示 '{btn_text}', 还没到可续期的时间")
-                msg = f"⏳ <b>Host-Ship 续期检查</b>\n服务器倒计时: <code>{days_left}</code>\n状态: 还没到可续期的时间 ({btn_text})"
-                sb.save_screenshot("hostship_limit.png")
-                send_tg_notification(msg, "hostship_limit.png")
-            else:
-                print(f"🖱️ 按钮显示 '{btn_text}', 尝试点击第一次续期按钮！")
-                sb.click(renew_button_selector)
-                
-                # 等待弹窗出现
-                time.sleep(3) 
-                
-                # 尝试点击二次确认弹窗里的 "Renew now"
-                try:
-                    print("👀 正在寻找弹窗中的 'Renew now' 确认按钮...")
-                    # 增加了 'Renew now' 选择器
-                    confirm_selector = "button:contains('Renew now'), button:contains('Confirm'), button.btn-primary"
-                    
-                    if sb.is_element_visible(confirm_selector):
-                        print("✅ 找到弹窗确认按钮，执行点击！")
-                        sb.click(confirm_selector)
-                        time.sleep(3)
-                    else:
-                        print("⚠️ 没有发现二次确认弹窗，可能面板改变了逻辑。")
-                except Exception as e:
-                    print(f"点击二次确认按钮时发生小错误: {e}")
-                
-                sb.save_screenshot("hostship_renew_success.png")
-                msg = f"🎉 <b>Host-Ship 续期成功</b>\n已成功完成二次确认续期操作！\n原剩余时间: {days_left}"
-                print(msg)
-                send_tg_notification(msg, "hostship_renew_success.png")
-        else:
-            print("⚠️ 未能在详情页找到 'Renew' 按钮组件")
-            sb.save_screenshot("hostship_no_renew_btn.png")
-            send_tg_notification("⚠️ <b>Host-Ship 状态</b>\n进入了详情页，但未发现续期组件。", "hostship_no_renew_btn.png")
-
+        m = re.search(r"RENEWAL IN\s*(\d+\s*Days?)", page_text, re.IGNORECASE)
+        if m:
+            result["days"] = re.sub(r"\s+", " ", m.group(1))
+        # 服务器名：优先用页面上识别到的标题
+        name_m = re.search(r"RENEWAL IN", page_text, re.IGNORECASE)
+        if name_m:
+            head = page_text[:name_m.start()].strip().splitlines()
+            if head:
+                cand = head[-1].strip()
+                if 2 < len(cand) < 60:
+                    result["label"] = cand
     except Exception as e:
-         print(f"处理续期状态时发生异常: {e}")
-         send_tg_notification(f"❌ <b>Host-Ship 解析异常</b>\n{e}")
+        result["detail"] = f"读取倒计时失败: {e}"
+
+    print(f"  📅 [{index}] {result['label']} — 倒计时 {result['days']}")
+
+    # 找续期按钮。sb.click/get_text 只接受单个选择器，先解析出可见的那个。
+    renew_selector = "button:contains('Renew'), button:contains('RENEW'), a:contains('Renew')"
+    hit = _first_visible_selector(sb, renew_selector)
+    if not hit:
+        result["status"] = "no_button"
+        result["detail"] = "未找到 Renew 按钮"
+        sb.save_screenshot(shot)
+        return result
+
+    btn_text = ""
+    try:
+        btn_text = sb.get_text(hit).strip()
+    except Exception:
+        pass
+
+    if "limit reached" in btn_text.lower():
+        result["status"] = "limit_reached"
+        result["detail"] = btn_text
+        print(f"  ⏳ [{index}] 还没到可续期时间（{btn_text}）")
+        sb.save_screenshot(shot)
+        return result
+
+    # 点击续期 + 二次确认
+    try:
+        print(f"  🖱️ [{index}] 点击续期按钮（{btn_text}）")
+        sb.click(hit)
+        time.sleep(3)
+        confirm_selector = ("button:contains('Renew now'), button:contains('Confirm'), "
+                            "button.btn-primary")
+        confirm_hit = _first_visible_selector(sb, confirm_selector)
+        if confirm_hit:
+            sb.click(confirm_hit)
+            time.sleep(3)
+            result["status"] = "renewed"
+        else:
+            # 没弹窗时，第一次点击本身可能已经生效
+            result["status"] = "clicked_no_confirm"
+            result["detail"] = "未见二次确认弹窗"
+        sb.save_screenshot(shot)
+    except Exception as e:
+        result["status"] = "click_failed"
+        result["detail"] = f"点击异常: {e}"
+        try:
+            sb.save_screenshot(shot)
+        except Exception:
+            pass
+
+    return result
+
 
 # ================== 主流程 ==================
+def process_all_renewals(sb, dashboard_url):
+    """遍历账号下所有服务器，逐台续期，返回结果列表。"""
+    targets, selector = discover_servers(sb, dashboard_url)
+    if not targets:
+        print("⚠️ 未发现任何服务器入口")
+        sb.save_screenshot("hostship_no_server.png")
+        send_tg_notification(
+            "⚠️ <b>Host-Ship 状态</b>\n登录成功，但未找到 Manage Server 入口。",
+            "hostship_no_server.png")
+        return []
+
+    print(f"🚀 共 {len(targets)} 台服务器待处理（选择器: {selector}）")
+    results = []
+    for i, t in enumerate(targets[:MAX_SERVERS]):
+        results.append(renew_server(sb, t, i, dashboard_url))
+
+    # 汇总一条通知，避免多服务器时刷屏
+    renewed = [r for r in results if r["status"] == "renewed"]
+    limits = [r for r in results if r["status"] == "limit_reached"]
+    others = [r for r in results if r not in renewed and r not in limits]
+
+    lines = [f"🔁 <b>Host-Ship 续期检查</b>（共 {len(results)} 台）"]
+    for r in results:
+        icon = {"renewed": "🎉", "limit_reached": "⏳"}.get(r["status"], "⚠️")
+        lines.append(f"{icon} {r['label'][:30]} — 剩余 <code>{r['days']}</code>"
+                     f"（{r['status']}）")
+    message = "\n".join(lines)
+
+    # 有成功续期的，附图；否则附第一台的截图作为凭证
+    photo = None
+    if renewed:
+        photo = f"hostship_{renewed[0]['index']}.png"
+    elif results:
+        photo = f"hostship_{results[0]['index']}.png"
+
+    print("\n" + message)
+    send_tg_notification(message, photo)
+    return results
+
+
 def run():
     if not EMAIL or not PASSWORD:
         print("❌ 错误: 缺少 HOSTSHIP_EMAIL 或 HOSTSHIP_PASSWORD")
-        sys.exit(1)
+        return 1
 
     sb_kwargs = dict(
         uc=True,
@@ -149,10 +300,9 @@ def run():
     # 未配置 NODE_LINK 时 PROXY_SERVER 为空 -> 退回直连，不会因为代理缺失而失败。
     proxy = os.getenv("PROXY_SERVER", "").strip()
     if proxy:
-        # 直接用 setup_proxy.sh 导出的值；SeleniumBase 会把它转成
-        # Chrome 的 --proxy-server=socks5://host:port。
         sb_kwargs["proxy"] = proxy
-        print(f"🌐 检测到代理，浏览器走代理: {proxy}")
+        # 只打印形态，不打印节点信息（本值是本地回环地址，但仍保持最小暴露）
+        print("🌐 已启用代理，浏览器流量经本地 socks5 转发")
     else:
         print("ℹ️ 未检测到 PROXY_SERVER，浏览器直连")
 
@@ -162,22 +312,22 @@ def run():
             sb.uc_open_with_reconnect(HOSTSHIP_LOGIN, reconnect_time=8)
             time.sleep(5)
 
-            user_selector = "input[name='user'], input[name='username'], input[type='text'], input[type='email']"
+            user_selector = ("input[name='user'], input[name='username'], "
+                             "input[type='text'], input[type='email']")
 
             if "login" in sb.get_current_url() or sb.is_element_visible(user_selector):
                 try:
                     print("📝 正在输入账号密码...")
                     sb.wait_for_element_visible(user_selector, timeout=10)
-                    
                     sb.clear(user_selector)
                     sb.type(user_selector, EMAIL)
-                    
+
                     pwd_selector = "input[name='password'], input[type='password']"
                     sb.wait_for_element_visible(pwd_selector, timeout=5)
                     sb.clear(pwd_selector)
                     sb.type(pwd_selector, PASSWORD)
                     time.sleep(1)
-                    
+
                     print("➡️ 寻找并点击 Sign In 按钮...")
                     submit_selector = "button:contains('Sign In'), button[type='submit']"
                     if sb.is_element_visible(submit_selector):
@@ -185,32 +335,34 @@ def run():
                     else:
                         print("未找到 Sign In 按钮，尝试回车提交...")
                         sb.type(pwd_selector, "\n")
-                    
-                    time.sleep(10) 
+                    time.sleep(10)
 
                 except Exception as e:
                     print(f"❌ 登录动作异常: {e}")
                     sb.save_screenshot("hostship_login_error.png")
-                    send_tg_notification("❌ <b>Host-Ship 异常</b>\n执行填表时发生错误。", "hostship_login_error.png")
-                    sys.exit(1)
+                    send_tg_notification("❌ <b>Host-Ship 异常</b>\n执行填表时发生错误。",
+                                         "hostship_login_error.png")
+                    return 1
 
             print("🔍 检查登录结果...")
             time.sleep(3)
             current_url = sb.get_current_url()
-            
+
             if "login" in current_url or sb.is_element_visible(user_selector):
                 print("❌ 登录失败！账号密码错误或被系统阻断。")
                 sb.save_screenshot("hostship_login_failed.png")
-                send_tg_notification("❌ <b>Host-Ship 登录失败</b>\n请查看截图排查原因（密码错误或被封锁）。", "hostship_login_failed.png")
-                sys.exit(1)
-            else:
-                print(f"✅ 登录成功，当前 URL: {current_url}")
-                process_renewal(sb)
-                sys.exit(0)
+                send_tg_notification("❌ <b>Host-Ship 登录失败</b>\n请查看截图排查原因。",
+                                     "hostship_login_failed.png")
+                return 1
+
+            print(f"✅ 登录成功，当前 URL: {current_url}")
+            process_all_renewals(sb, current_url)
+            return 0
 
     except Exception as e:
         print(f"脚本致命异常: {e}")
-        sys.exit(1)
+        return 1
+
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run())
