@@ -6,6 +6,8 @@ import sys
 import time
 import re
 import platform
+from urllib.parse import urljoin, urlparse
+
 import requests
 from seleniumbase import SB
 
@@ -18,8 +20,10 @@ PASSWORD = os.getenv("HOSTSHIP_PASSWORD")
 # 一个账号下可能有多个服务器；原来的实现只点第一个入口就 break，
 # 导致多服务器账号只续期了一台。这里枚举后逐个处理。
 MAX_SERVERS = 20          # 防御性上限，避免选择器误匹配导致死循环
+# 注意 href 的写法面板可能给 "server/x"、"/server/x" 或完整 URL，
+# 因此用 'server/' 而非 '/server/' 匹配，两种情况都能命中。
 SERVER_ENTRY_SELECTORS = (
-    "a[href*='/server/']",
+    "a[href*='server/']",
     "a:contains('MANAGE SERVER')",
     "button:contains('MANAGE SERVER')",
     "a:contains('Manage Server')",
@@ -107,6 +111,29 @@ def _element_label(el):
     return ""
 
 
+# 卡片文本形如：
+#   "gghhh's server # 98a56209 Installing CPU 0% RAM Offline Disk ..."
+# 取到第一个状态词为止，只保留服务器名部分，避免通知里塞进整段卡片文字。
+_SERVER_LABEL_CUT = re.compile(
+    r"\s+(Installing|Online|Offline|Suspended|Running|Stopped|Starting|"
+    r"CPU|RAM|Disk)\b",
+    re.IGNORECASE)
+
+
+def _clean_server_label(raw, fallback):
+    """从卡片文本里截出服务器名，失败则用 fallback。"""
+    if not raw:
+        return fallback
+    text = re.sub(r"\s+", " ", raw).strip()
+    m = _SERVER_LABEL_CUT.search(text)
+    if m:
+        text = text[:m.start()]
+    text = text.strip(" -#")
+    if 2 <= len(text) <= 60:
+        return text
+    return fallback
+
+
 # ================== 发现服务器 ==================
 def discover_servers(sb, dashboard_url):
     """枚举面板上所有服务器入口。
@@ -127,16 +154,21 @@ def discover_servers(sb, dashboard_url):
             continue
 
         targets, seen = [], set()
-        for el in els:
+        for idx, el in enumerate(els):
             try:
                 href = el.get_attribute("href")
             except Exception:
                 href = None
-            label = _element_label(el)
-            key = href or f"idx:{len(targets)}"
+
+            # href 可能是相对路径；用它做去重键前先统一成绝对路径，
+            # 否则 "server/x" 与 "/server/x" 会被当成两台。
+            key = urljoin(dashboard_url, href) if href else f"idx:{idx}"
             if key in seen:          # 同一服务器可能被多个选择器命中，去重
                 continue
             seen.add(key)
+
+            fallback = f"服务器#{len(targets) + 1}"
+            label = _clean_server_label(_element_label(el), fallback)
             targets.append({"label": label, "href": href})
 
         if targets:
@@ -153,8 +185,13 @@ def renew_server(sb, target, index, dashboard_url):
     shot = f"hostship_{index}.png"
 
     try:
-        if target.get("href"):
-            sb.open(target["href"])
+        href = target.get("href")
+        if href:
+            # 面板给的是相对路径（如 "server/98a56209"）。直接交给 sb.open 时
+            # Chrome 会把首段当成主机名，请求打到 http://server/... 上并报
+            # ERR_CONNECTION_CLOSED —— 必须先补成绝对 URL。
+            url = urljoin(dashboard_url, href)
+            sb.open(url)
         else:
             # 没有 href 的入口只能按下标点击；先回 dashboard 再点
             sb.open(dashboard_url)
@@ -170,20 +207,33 @@ def renew_server(sb, target, index, dashboard_url):
         result["detail"] = f"无法打开页面: {e}"
         return result
 
+    # 导航有效性校验：Chrome 的错误页也会被当作正常页面加载，
+    # 若不一早识破，后面所有判断都会在错误页上做，得到误导性的 no_button。
+    try:
+        body = sb.get_text("body") or ""
+        landed = sb.get_current_url()
+        if ("This site can't be reached" in body
+                or "ERR_CONNECTION" in body
+                or "ERR_NAME_NOT_RESOLVED" in body):
+            result["status"] = "nav_failed"
+            result["detail"] = f"页面未加载成功（{landed}）"
+            sb.save_screenshot(shot)
+            return result
+        if urlparse(landed).netloc != urlparse(dashboard_url).netloc:
+            # 被重定向到别的域（或仍是相对 URL 造成的错误域），视为失败
+            result["status"] = "nav_failed"
+            result["detail"] = f"跳转到了异常域名: {landed}"
+            sb.save_screenshot(shot)
+            return result
+    except Exception:
+        pass
+
     # 读续期倒计时。注意 "1 Day" 是合法的单数形式，原正则要求 Days 会漏掉。
     try:
         page_text = sb.get_text("body")
         m = re.search(r"RENEWAL IN\s*(\d+\s*Days?)", page_text, re.IGNORECASE)
         if m:
             result["days"] = re.sub(r"\s+", " ", m.group(1))
-        # 服务器名：优先用页面上识别到的标题
-        name_m = re.search(r"RENEWAL IN", page_text, re.IGNORECASE)
-        if name_m:
-            head = page_text[:name_m.start()].strip().splitlines()
-            if head:
-                cand = head[-1].strip()
-                if 2 < len(cand) < 60:
-                    result["label"] = cand
     except Exception as e:
         result["detail"] = f"读取倒计时失败: {e}"
 
