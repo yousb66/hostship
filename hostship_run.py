@@ -141,8 +141,20 @@ def run():
         headed=not is_linux(),
         chromium_arg="--disable-blink-features=AutomationControlled",
     )
-    
-    # sb_kwargs["proxy"] = "socks5://127.0.0.1:1080"
+
+    # ================== 代理（可选） ==================
+    # 代理由 workflow 里调用的 setup_proxy.sh 启动（sing-box 监听本地 1080），
+    # 成功后它会导出 PROXY_SERVER=socks5://127.0.0.1:1080 与 IS_PROXY=true。
+    # 这里直接读回来用，所以换节点只需改 GitHub Secret 的 NODE_LINK，脚本无需改动。
+    # 未配置 NODE_LINK 时 PROXY_SERVER 为空 -> 退回直连，不会因为代理缺失而失败。
+    proxy = os.getenv("PROXY_SERVER", "").strip()
+    if proxy:
+        # 直接用 setup_proxy.sh 导出的值；SeleniumBase 会把它转成
+        # Chrome 的 --proxy-server=socks5://host:port。
+        sb_kwargs["proxy"] = proxy
+        print(f"🌐 检测到代理，浏览器走代理: {proxy}")
+    else:
+        print("ℹ️ 未检测到 PROXY_SERVER，浏览器直连")
 
     try:
         with SB(**sb_kwargs) as sb:
